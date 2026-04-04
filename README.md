@@ -1,87 +1,79 @@
-# BAB256 — Dimensional Engine
+# BAB64 — Self-Referential Image Hash
 
-**Lattice-Based Proof of Work in Babel Image Space**
+**The image defines its own hash function, then is hashed by it.**
 
-A novel cryptographic proof-of-work primitive that combines SHA-256's proven security with the Closest Vector Problem (CVP) operating natively in 4,096-dimensional image space derived from Babel's Universal Image Archive.
+A novel proof-of-work primitive where every 64x64 Babel image produces a unique cryptographic compression function — derived from its own pixels — which is then applied to the image itself. Mining becomes a fixed-point search in function space: find an image whose self-generated hash meets the difficulty target.
 
-## Security Properties
+No known PoW system uses input-dependent hash parameterization.
 
-| Property | SHA-256 (Bitcoin) | BAB256 |
+## What Makes It Novel
+
+In every existing PoW system (Bitcoin, Ethash, Equihash), the hash function is fixed. Miners search for inputs that produce a desired output under that static function.
+
+BAB64 inverts this: **the input defines the function**. Each image's pixels are used to derive:
+
+- **Round constants** (like SHA-256's K[]) — from pixel blocks
+- **Rotation schedule** (like SHA-256's ROTR) — from pixel columns
+- **S-box** (like AES substitution) — Fisher-Yates shuffle seeded by image
+- **Initial state** (like SHA-256's H0) — from image hash
+
+Then this unique function hashes the image that created it.
+
+## Hash Quality
+
+| Metric | Measured | Ideal |
 |---|---|---|
-| Classical hardness | 2^256 | 2^1,196 |
-| Quantum hardness | 2^128 (Grover) | 2^1,085 |
-| Hard problem | Hash preimage | CVP (NP-hard) |
-| Memory requirement | ~0 | ~2 MB (basis) |
-| ASIC resistance | None | High |
-| Verification asymmetry | ~1x | 500x+ |
-
-## Architecture
-
-```
-Input → SHA-256(input) → seed
-seed → Generate 128 basis images in Z^4096 (Babel lattice)
-seed + nonce → Generate target image
-HARD PART: Solve approximate CVP — find integer coefficients
-           c₁...c₁₂₈ minimizing distance to target in lattice
-proof = SHA-256(coefficients || target_hash || nonce)
-Check: proof has required leading zero bits (difficulty)
-```
-
-## Files
-
-- `bab256_engine_v02.py` — Core engine with 4 CVP solvers + blockchain simulation
-- `test_bab256.py` — 46 tests proving cryptographic invariants
-- `bab256_engine.py` — v0.1 (historical reference, superseded)
+| Avalanche (1px flip) | 49.9% bits change | 50.0% |
+| Bit distribution P(bit=1) | 0.501 | 0.500 |
+| Collisions (200 trials) | 0 | 0 |
 
 ## Quick Start
 
 ```bash
-# Run engine demo (solver benchmark + mining + chain)
-python3 bab256_engine_v02.py
+# Run engine demo (quality analysis + mining + chain)
+python3 bab64_engine.py
 
-# Run full test suite
-python3 test_bab256.py
+# Run full test suite (52 tests)
+python3 test_bab64.py
 ```
 
-## Test Results (v0.2)
+## How It Works
 
 ```
-46/46 tests passed
-
-✓ Determinism      — Same input always produces same output
-✓ Tamper resistance — Any modification invalidates proof
-✓ Avalanche effect  — 1-bit input change → ~50% output change
-✓ Verification      — 500x+ faster than mining
-✓ Difficulty scaling — Mining time scales with difficulty
-✓ Solver quality    — Babai beats random, combined beats all
-✓ Chain integrity   — 3-block chain validates with tamper detection
-✓ Edge cases        — Empty input, unicode, serialization roundtrip
+1. Input → SHA-256 → base_seed
+2. base_seed + nonce → BabelRender → 64×64 image (4,096 pixels)
+3. Image pixels → derive round constants, rotations, S-box, initial state
+4. Apply this image-specific hash function TO the image itself
+   → If hash has enough leading zeros: proof found
+   → Otherwise: increment nonce, goto 2
 ```
 
-## CVP Solvers
+Verification: regenerate the image, re-derive the hash function, re-hash. One nonce check vs. thousands during mining.
 
-| Solver | Method | Speed | Quality |
-|---|---|---|---|
-| `greedy` | Random start + local search | Medium | Worst |
-| `babai_round` | Least-squares + rounding | Fast | Good |
-| `babai_plane` | Gram-Schmidt + nearest plane | Medium | Better |
-| `combined` | Babai seed + greedy refinement | Slower | Best |
+## Comparison
 
-## Roadmap
+| | Bitcoin (SHA-256) | Ethash | Equihash | **BAB64** |
+|---|---|---|---|---|
+| Hash function | Fixed | Fixed | Fixed | **Input-dependent** |
+| Hard problem | Preimage | Memory-hard hash | Birthday bound | **Self-referential fixed point** |
+| Input defines function? | No | No | No | **Yes** |
+| ASIC resistance | None | Medium | Medium | High (dynamic function) |
+| Memory per hash | ~0 | ~2 GB DAG | ~144 MB | ~2 MB (image + params) |
+| Construction | Merkle-Damgard | Keccak-based | Wagner's algorithm | **Image-parameterized M-D** |
 
-- [ ] Difficulty scaling benchmark with charts
-- [ ] Formal parameter analysis (basis count, coefficient bounds)
-- [ ] BKZ lattice reduction integration (fpylll)
-- [ ] SNARK/STARK proof compression
-- [ ] C/Rust high-performance implementation
-- [ ] Formal specification / whitepaper
-- [ ] Academic submission (IACR ePrint)
+## BAB256 — Lattice Engine (Historical)
+
+BAB256 was the research path that led to BAB64. It combines SHA-256 with the Closest Vector Problem (CVP) in 4,096-dimensional image space — a lattice-based PoW with quantum resistance claims.
+
+Kept for historical reference:
+- `bab256_engine_v02.py` — Core engine with 4 CVP solvers
+- `test_bab256.py` — 46 tests
+
+BAB64 is the distilled insight: you don't need the lattice machinery when the image itself can define the hash function.
 
 ## Origin
 
-Concept by Shrey — inspired by the question: "Can the entropy of Babel's Universal Image Archive be harnessed for cryptographic security?"
-
-The answer: not the entropy itself, but the *dimensionality* — by making the hard problem (CVP) operate natively in image-space dimensions rather than compressing through a 256-bit bottleneck.
+Concept by Shrey — born from the question: *"Can a Babel image be its own cryptographic primitive?"* The answer turned out to be yes: not by using the image as data to be hashed, but by using it as the hash function's parameters. The image is simultaneously the message, the key, and the algorithm.
 
 ## License
 
