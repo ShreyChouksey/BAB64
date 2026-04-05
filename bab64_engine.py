@@ -234,6 +234,43 @@ class ImageHash:
         x = x & 0xFFFFFFFF
         return ((x >> n) | (x << (32 - n))) & 0xFFFFFFFF
 
+    def _expand_message(self, w_in: np.ndarray) -> np.ndarray:
+        """
+        Expand 8 message words to 32 using sigma-style mixing.
+
+        Two phases:
+          1. Pre-mix: 8 rounds of circular mixing so every base
+             word depends on ALL input words. This ensures that
+             a 1-bit flip in ANY message word affects round 0.
+          2. Expand: grow 8 mixed words to 32 via sigma functions,
+             giving every round a unique, well-mixed schedule word.
+        """
+        w = np.zeros(32, dtype=np.uint32)
+        for i in range(8):
+            w[i] = w_in[i]
+
+        # Phase 1: Pre-mix — 3 passes of circular mixing
+        # Each pass propagates dependencies 2 hops (prev + next).
+        # After 3 passes, every word depends on all 8 inputs.
+        for _pass in range(3):
+            for i in range(8):
+                prev = int(w[(i + 7) % 8])
+                nxt = int(w[(i + 1) % 8])
+                w[i] = np.uint32(
+                    (int(w[i]) ^ self._rotr32(prev, 7)
+                     ^ self._rotr32(nxt, 13))
+                    + prev & 0xFFFFFFFF
+                )
+
+        # Phase 2: Expand 8 → 32
+        for i in range(8, 32):
+            w[i] = np.uint32(
+                (int(w[i - 2]) ^ self._rotr32(int(w[i - 3]), 7))
+                + int(w[i - 8])
+                & 0xFFFFFFFF
+            )
+        return w
+
     def _compress(
         self,
         state: np.ndarray,
@@ -252,16 +289,26 @@ class ImageHash:
         The 8 state words go through num_rounds rounds of:
           1. S-box substitution (non-linear, from image)
           2. Rotation (diffusion, amount from image)
-          3. XOR with round constant (from image)
+          3. XOR with round constant + expanded message word
           4. Modular addition (non-linear mixing)
-          5. Word rotation within state (diffusion)
+          5. Multi-word message injection (both state halves)
+          6. Word rotation within state (diffusion)
+
+        Message expansion: 8 input words → 32 via sigma mixing,
+        so every round gets a unique, well-mixed message word.
+        Multi-word injection: each round mixes the expanded word
+        into s[0] (XOR) AND s[4] (addition), touching both
+        halves of the state simultaneously.
         """
-        # Expand message block to 8 × 32-bit words
-        w = np.zeros(8, dtype=np.uint32)
+        # Parse message block to 8 × 32-bit words
+        w_in = np.zeros(8, dtype=np.uint32)
         for i in range(min(8, len(message_block) // 4)):
-            w[i] = int.from_bytes(
+            w_in[i] = int.from_bytes(
                 message_block[i*4:(i+1)*4], 'big'
             )
+
+        # Expand 8 words → 32 (one unique word per round)
+        w = self._expand_message(w_in)
 
         # Working variables (copy of state)
         s = state.copy()
@@ -269,6 +316,7 @@ class ImageHash:
         for r in range(self.config.num_rounds):
             rc = int(round_constants[r % len(round_constants)])
             rot = int(rotations[r % len(rotations)])
+            wr = int(w[r % 32])
 
             # --- STEP 1: S-box substitution on state bytes ---
             # Apply S-box to each byte of the first state word
@@ -280,20 +328,25 @@ class ImageHash:
             # --- STEP 2: Rotation (diffusion) ---
             s[0] = np.uint32(self._rotr32(int(s[0]), rot))
 
-            # --- STEP 3: XOR with round constant + message word ---
-            s[0] = np.uint32(int(s[0]) ^ rc ^ int(w[r % 8]))
+            # --- STEP 3: XOR with round constant + expanded message word ---
+            s[0] = np.uint32(int(s[0]) ^ rc ^ wr)
 
             # --- STEP 4: Modular addition with neighbor ---
             s[0] = np.uint32((int(s[0]) + int(s[1])) & 0xFFFFFFFF)
 
-            # --- STEP 5: Majority-like boolean function ---
+            # --- STEP 5: Multi-word message injection ---
+            # Inject expanded message word into s[4] (second half)
+            # so every round touches BOTH halves of the state
+            s[4] = np.uint32((int(s[4]) + wr) & 0xFFFFFFFF)
+
+            # --- STEP 6: Majority-like boolean function ---
             # maj(a,b,c) = (a AND b) XOR (a AND c) XOR (b AND c)
             maj = (int(s[0]) & int(s[1])) ^ \
                   (int(s[0]) & int(s[2])) ^ \
                   (int(s[1]) & int(s[2]))
             s[3] = np.uint32((int(s[3]) + maj) & 0xFFFFFFFF)
 
-            # --- STEP 6: Conditional function ---
+            # --- STEP 7: Conditional function ---
             # ch(e,f,g) = (e AND f) XOR (NOT e AND g)
             ch = (int(s[4]) & int(s[5])) ^ \
                  ((~int(s[4]) & 0xFFFFFFFF) & int(s[6]))
@@ -301,7 +354,7 @@ class ImageHash:
                 (int(s[7]) + ch + rc) & 0xFFFFFFFF
             )
 
-            # --- STEP 7: Rotate state words ---
+            # --- STEP 8: Rotate state words ---
             # Like SHA-256's working variable rotation
             s = np.roll(s, 1)
 

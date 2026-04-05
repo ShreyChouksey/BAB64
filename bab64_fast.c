@@ -29,14 +29,52 @@ static inline void write_be32(uint8_t *p, uint32_t v) {
 }
 
 /*
+ * expand_message:
+ *   Expand 8 message words to 32 using sigma-style mixing.
+ *   Phase 1: 3 passes of circular pre-mixing (all 8 depend on all 8).
+ *   Phase 2: Expand 8 → 32 via sigma functions.
+ *
+ *   Must exactly match Python ImageHash._expand_message.
+ *
+ *   Python operator precedence note:
+ *     (a ^ b ^ c) + d & MASK  parses as  ((a ^ b ^ c) + d) & MASK
+ *     (a ^ b) + c & MASK      parses as  ((a ^ b) + c) & MASK
+ *   because + binds tighter than & which binds tighter than ^,
+ *   BUT the Python code has explicit parens around the XOR part,
+ *   so the effective evaluation is:
+ *     Phase 1: ((w[i] ^ rotr(prev,7) ^ rotr(nxt,13)) + prev) & 0xFFFFFFFF
+ *     Phase 2: ((w[i-2] ^ rotr(w[i-3],7)) + w[i-8]) & 0xFFFFFFFF
+ */
+static void expand_message(const uint8_t *message_block, uint32_t *w) {
+    /* Parse 8 big-endian words from message block */
+    for (int i = 0; i < 8; i++) {
+        w[i] = read_be32(message_block + i * 4);
+    }
+
+    /* Phase 1: Pre-mix — 3 passes of circular mixing */
+    for (int pass = 0; pass < 3; pass++) {
+        for (int i = 0; i < 8; i++) {
+            uint32_t prev = w[(i + 7) % 8];
+            uint32_t nxt  = w[(i + 1) % 8];
+            w[i] = (w[i] ^ rotr32(prev, 7) ^ rotr32(nxt, 13)) + prev;
+        }
+    }
+
+    /* Phase 2: Expand 8 → 32 */
+    for (int i = 8; i < 32; i++) {
+        w[i] = (w[i - 2] ^ rotr32(w[i - 3], 7)) + w[i - 8];
+    }
+}
+
+/*
  * bab64_compress:
- *   state_in:        8 × uint32 (big-endian byte array, 32 bytes)
+ *   state_in:        8 × uint32 (native byte order array)
  *   message_block:   32 bytes
- *   round_constants: num_rounds × uint32 (native byte order array)
- *   rotations:       num_rounds × int32 (native byte order array)
+ *   round_constants: num_rc × uint32 (native byte order array)
+ *   rotations:       num_rot × int32 (native byte order array)
  *   sbox:            256 bytes
  *   num_rounds:      number of compression rounds
- *   state_out:       8 × uint32 (big-endian byte array, 32 bytes)
+ *   state_out:       8 × uint32 (native byte order array)
  */
 void bab64_compress(
     const uint32_t *state_in,
@@ -49,11 +87,9 @@ void bab64_compress(
     int             num_rot,
     uint32_t       *state_out
 ) {
-    /* Expand message block to 8 × 32-bit words (big-endian) */
-    uint32_t w[8];
-    for (int i = 0; i < 8; i++) {
-        w[i] = read_be32(message_block + i * 4);
-    }
+    /* Expand message: 8 input words → 32 via pre-mix + sigma expansion */
+    uint32_t w[32];
+    expand_message(message_block, w);
 
     /* Working copy of state */
     uint32_t s[8];
@@ -64,6 +100,7 @@ void bab64_compress(
     for (int r = 0; r < num_rounds; r++) {
         uint32_t rc = round_constants[r % num_rc];
         int rot = rotations[r % num_rot];
+        uint32_t wr = w[r % 32];
 
         /* STEP 1: S-box substitution on s[0] bytes */
         uint8_t b0 = (uint8_t)(s[0] >> 24);
@@ -76,21 +113,24 @@ void bab64_compress(
         /* STEP 2: Rotation */
         s[0] = rotr32(s[0], rot);
 
-        /* STEP 3: XOR with round constant + message word */
-        s[0] ^= rc ^ w[r % 8];
+        /* STEP 3: XOR with round constant + expanded message word */
+        s[0] ^= rc ^ wr;
 
         /* STEP 4: Modular addition with neighbor */
-        s[0] = (s[0] + s[1]) & 0xFFFFFFFF;
+        s[0] = s[0] + s[1];
 
-        /* STEP 5: Majority function */
+        /* STEP 5: Multi-word message injection into s[4] */
+        s[4] = s[4] + wr;
+
+        /* STEP 6: Majority function */
         uint32_t maj = (s[0] & s[1]) ^ (s[0] & s[2]) ^ (s[1] & s[2]);
-        s[3] = (s[3] + maj) & 0xFFFFFFFF;
+        s[3] = s[3] + maj;
 
-        /* STEP 6: Conditional (choice) function */
+        /* STEP 7: Conditional (choice) function */
         uint32_t ch = (s[4] & s[5]) ^ ((~s[4]) & s[6]);
-        s[7] = (s[7] + ch + rc) & 0xFFFFFFFF;
+        s[7] = s[7] + ch + rc;
 
-        /* STEP 7: Rotate state words (roll right by 1) */
+        /* STEP 8: Rotate state words (roll right by 1) */
         uint32_t tmp = s[7];
         for (int i = 7; i > 0; i--) {
             s[i] = s[i - 1];
@@ -100,7 +140,7 @@ void bab64_compress(
 
     /* Davies-Meyer feedforward */
     for (int i = 0; i < 8; i++) {
-        state_out[i] = (s[i] + state_in[i]) & 0xFFFFFFFF;
+        state_out[i] = s[i] + state_in[i];
     }
 }
 
