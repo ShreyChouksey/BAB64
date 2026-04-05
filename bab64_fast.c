@@ -136,6 +136,14 @@ void bab64_compress(
             s[i] = s[i - 1];
         }
         s[0] = tmp;
+
+        /* STEP 9: Parallel diffusion (MixColumns-like) */
+        /* Each word absorbs rotated bits from two non-adjacent words */
+        uint32_t t[8];
+        memcpy(t, s, sizeof(t));
+        for (int i = 0; i < 8; i++) {
+            s[i] = t[i] ^ rotr32(t[(i + 2) % 8], 11) ^ rotr32(t[(i + 5) % 8], 19);
+        }
     }
 
     /* Davies-Meyer feedforward */

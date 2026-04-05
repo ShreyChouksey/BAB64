@@ -266,6 +266,14 @@ def run_analysis(num_trials=200):
                          ((~int(s[4]) & 0xFFFFFFFF) & int(s[6]))
                     s[7] = np.uint32((int(s[7]) + ch + rcc) & 0xFFFFFFFF)
                     s = np.roll(s, 1)
+                    # Step 9: Parallel diffusion
+                    t = s.copy()
+                    for ii2 in range(8):
+                        s[ii2] = np.uint32(
+                            int(t[ii2])
+                            ^ hasher._rotr32(int(t[(ii2 + 2) % 8]), 11)
+                            ^ hasher._rotr32(int(t[(ii2 + 5) % 8]), 19)
+                        )
                 return s
 
             hasher.config.num_rounds = original

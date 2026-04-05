@@ -358,6 +358,18 @@ class ImageHash:
             # Like SHA-256's working variable rotation
             s = np.roll(s, 1)
 
+            # --- STEP 9: Parallel diffusion (MixColumns-like) ---
+            # Each word absorbs rotated bits from two non-adjacent
+            # words, ensuring a change in ANY word propagates to ALL
+            # 8 words in a single round.
+            t = s.copy()
+            for i in range(8):
+                s[i] = np.uint32(
+                    int(t[i])
+                    ^ self._rotr32(int(t[(i + 2) % 8]), 11)
+                    ^ self._rotr32(int(t[(i + 5) % 8]), 19)
+                )
+
         # Davies-Meyer: add original state (feedforward)
         result = np.zeros(8, dtype=np.uint32)
         for i in range(8):
