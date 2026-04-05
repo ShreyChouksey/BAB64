@@ -72,8 +72,8 @@ class TestSignatureValidity:
     def test_signature_length(self):
         identity = BAB64Identity(SEED_A)
         sig = identity.sign(b"test")
-        assert len(sig) == 256
-        assert all(len(s) == 32 for s in sig)
+        assert len(sig.raw) == 256
+        assert all(len(s) == 32 for s in sig.raw)
 
     def test_verification_key_length(self):
         identity = BAB64Identity(SEED_A)
@@ -87,7 +87,7 @@ class TestSignatureValidity:
         msg = b"determinism check"
         sig1 = id1.sign(msg)
         sig2 = id2.sign(msg)
-        assert sig1 == sig2
+        assert sig1.raw == sig2.raw
 
 
 # =============================================================================
@@ -112,7 +112,7 @@ class TestForgeryRejection:
         identity = BAB64Identity(SEED_A)
         sig = identity.sign(b"test")
         assert not LamportKeyPair.verify(
-            b"test", sig[:255], identity.verification_key
+            b"test", sig.raw[:255], sig.verification_key
         )
 
     def test_corrupted_signature_rejected(self):
@@ -120,7 +120,7 @@ class TestForgeryRejection:
         msg = b"integrity test"
         sig = identity.sign(msg)
         # Corrupt one element
-        sig[0] = b'\x00' * 32
+        sig.raw[0] = b'\x00' * 32
         assert not identity.verify(msg, sig)
 
     def test_empty_signature_rejected(self):
@@ -141,14 +141,16 @@ class TestSignatureDiversity:
         identity = BAB64Identity(SEED_A)
         sig1 = identity.sign(b"message one")
         sig2 = identity.sign(b"message two")
-        assert sig1 != sig2
+        # Different key indices → different raw sigs guaranteed
+        assert sig1.raw != sig2.raw
 
     def test_one_bit_message_difference(self):
-        identity = BAB64Identity(SEED_A)
-        sig1 = identity.sign(b"\x00")
-        sig2 = identity.sign(b"\x01")
-        # At least some revealed keys must differ
-        differences = sum(1 for a, b in zip(sig1, sig2) if a != b)
+        id1 = BAB64Identity(SEED_A)
+        id2 = BAB64Identity(SEED_A)
+        sig1 = id1.sign(b"\x00")
+        sig2 = id2.sign(b"\x01")
+        # Same key index (0), different messages → some revealed keys differ
+        differences = sum(1 for a, b in zip(sig1.raw, sig2.raw) if a != b)
         assert differences > 0
 
 
@@ -163,7 +165,7 @@ class TestTransactions:
         alice = BAB64Identity(SEED_A)
         bob = BAB64Identity(SEED_B)
         tx = sign_transaction(alice, bob, 100)
-        assert verify_transaction(tx, alice.verification_key)
+        assert verify_transaction(tx)
 
     def test_transaction_has_hash(self):
         alice = BAB64Identity(SEED_A)
@@ -176,7 +178,7 @@ class TestTransactions:
         bob = BAB64Identity(SEED_B)
         tx = sign_transaction(alice, bob, 100)
         tx.amount = 999
-        assert not verify_transaction(tx, alice.verification_key)
+        assert not verify_transaction(tx)
 
     def test_tamper_receiver_rejected(self):
         alice = BAB64Identity(SEED_A)
@@ -184,14 +186,14 @@ class TestTransactions:
         charlie = BAB64Identity(hashlib.sha256(b"charlie").digest())
         tx = sign_transaction(alice, bob, 100)
         tx.receiver = charlie.address_hex
-        assert not verify_transaction(tx, alice.verification_key)
+        assert not verify_transaction(tx)
 
     def test_tamper_sender_rejected(self):
         alice = BAB64Identity(SEED_A)
         bob = BAB64Identity(SEED_B)
         tx = sign_transaction(alice, bob, 100)
         tx.sender = bob.address_hex
-        assert not verify_transaction(tx, alice.verification_key)
+        assert not verify_transaction(tx)
 
     def test_unsigned_transaction_rejected(self):
         tx = BAB64Transaction(sender="aa" * 32, receiver="bb" * 32, amount=10)

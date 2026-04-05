@@ -51,6 +51,7 @@ class LamportKeyPair:
         self._sk1: List[bytes] = []
         self.pk0: List[bytes] = []
         self.pk1: List[bytes] = []
+        self._used: bool = False  # Lamport keys are ONE-TIME use
 
         for i in range(256):
             i_bytes = i.to_bytes(4, 'big')
@@ -66,7 +67,14 @@ class LamportKeyPair:
         Sign a message using Lamport scheme.
 
         Returns 256 secret key halves — one per bit of SHA-256(message).
+        Raises RuntimeError on second use — Lamport keys are one-time.
         """
+        if self._used:
+            raise RuntimeError(
+                "Lamport key already used — one-time signatures "
+                "cannot be reused safely. Generate a new key pair."
+            )
+        self._used = True
         msg_hash = hashlib.sha256(message).digest()
         signature = []
         for i in range(256):
@@ -116,6 +124,18 @@ class LamportKeyPair:
 
 
 # =============================================================================
+# BAB64 SIGNATURE — wraps raw Lamport sig with metadata
+# =============================================================================
+
+@dataclass
+class BAB64Signature:
+    """A Lamport signature with its key index and verification key."""
+    raw: List[bytes]
+    key_index: int
+    verification_key: List[bytes]
+
+
+# =============================================================================
 # BAB64 IDENTITY
 # =============================================================================
 
@@ -143,8 +163,8 @@ class BAB64Identity:
         hasher = ImageHash(self.config)
         self.address = hasher.hash_image(self._image)
 
-        # Derive Lamport signing keys from the image
-        self._lamport = LamportKeyPair(self._image_bytes)
+        # Lamport key index — each signing derives a fresh keypair
+        self._key_index = 0
 
     @classmethod
     def generate(cls, config: BAB64Config = None) -> 'BAB64Identity':
@@ -152,21 +172,59 @@ class BAB64Identity:
         private_key = os.urandom(32)
         return cls(private_key, config)
 
+    def _derive_lamport(self, index: int) -> LamportKeyPair:
+        """Derive a fresh Lamport keypair for the given index."""
+        # Each index produces a unique keypair from the image
+        seed = self._image_bytes + index.to_bytes(4, 'big')
+        return LamportKeyPair(seed)
+
     @property
     def address_hex(self) -> str:
         return self.address.hex()
 
+    def current_verification_key(self) -> List[bytes]:
+        """Return the verification key for the NEXT signing operation."""
+        return self._derive_lamport(self._key_index).verification_key()
+
     @property
     def verification_key(self) -> List[bytes]:
-        return self._lamport.verification_key()
+        """Return the verification key for key_index=0 (backwards compat)."""
+        return self._derive_lamport(0).verification_key()
 
-    def sign(self, message: bytes) -> List[bytes]:
-        """Sign a message with this identity's Lamport key."""
-        return self._lamport.sign(message)
+    def sign(self, message: bytes) -> 'BAB64Signature':
+        """
+        Sign a message, advancing to a fresh Lamport key.
 
-    def verify(self, message: bytes, signature: List[bytes]) -> bool:
-        """Verify a signature against this identity's public key."""
-        return LamportKeyPair.verify(message, signature, self.verification_key)
+        Returns a BAB64Signature containing the raw sig, key index,
+        and verification key needed for standalone verification.
+        """
+        key_index = self._key_index
+        lamport = self._derive_lamport(key_index)
+        raw_sig = lamport.sign(message)
+        vk = lamport.verification_key()
+        self._key_index += 1
+        return BAB64Signature(raw=raw_sig, key_index=key_index,
+                              verification_key=vk)
+
+    def verify(self, message: bytes, signature) -> bool:
+        """
+        Verify a signature was produced by THIS identity.
+
+        For BAB64Signature: re-derive the expected verification key at
+        the claimed key_index and compare — prevents cross-identity forgery.
+        For raw list: check against key_index=0.
+        """
+        if isinstance(signature, BAB64Signature):
+            expected_vk = self._derive_lamport(signature.key_index).verification_key()
+            if expected_vk != signature.verification_key:
+                return False
+            return LamportKeyPair.verify(
+                message, signature.raw, expected_vk
+            )
+        # Legacy: raw list of bytes with key_index=0
+        return LamportKeyPair.verify(
+            message, signature, self._derive_lamport(0).verification_key()
+        )
 
 
 # =============================================================================
@@ -182,25 +240,36 @@ class BAB64Transaction:
       sender:    sender's public address (hex)
       receiver:  receiver's public address (hex)
       amount:    transfer amount
+      nonce:     unique per-transaction counter (replay protection)
       signature: Lamport signature over the transaction hash
-      tx_hash:   SHA-256 of (sender || receiver || amount)
+      tx_hash:   SHA-256 of (sender || receiver || amount || nonce)
     """
     sender: str
     receiver: str
     amount: int
+    nonce: int = 0
     signature: List[bytes] = field(default_factory=list)
     tx_hash: str = ""
 
+    def __post_init__(self):
+        self._verification_key: Optional[List[bytes]] = None
+
     def _compute_hash(self) -> bytes:
-        """Compute transaction hash from sender, receiver, amount."""
-        payload = f"{self.sender}:{self.receiver}:{self.amount}".encode()
+        """Compute transaction hash from sender, receiver, amount, nonce."""
+        payload = f"{self.sender}:{self.receiver}:{self.amount}:{self.nonce}".encode()
         return hashlib.sha256(payload).digest()
 
     def sign(self, identity: BAB64Identity) -> None:
         """Sign this transaction with the sender's identity."""
         tx_bytes = self._compute_hash()
         self.tx_hash = tx_bytes.hex()
-        self.signature = identity.sign(tx_bytes)
+        sig = identity.sign(tx_bytes)
+        if isinstance(sig, BAB64Signature):
+            self.signature = sig.raw
+            self._verification_key = sig.verification_key
+        else:
+            self.signature = sig
+            self._verification_key = None
 
     def verify(self, sender_verification_key: List[bytes]) -> bool:
         """Verify transaction signature against sender's public key."""
@@ -213,6 +282,45 @@ class BAB64Transaction:
             tx_bytes, self.signature, sender_verification_key
         )
 
+    def verify_self(self) -> bool:
+        """Verify using the embedded verification key (from signing)."""
+        if self._verification_key is None:
+            return False
+        return self.verify(self._verification_key)
+
+
+# =============================================================================
+# TRANSACTION POOL — Replay Detection
+# =============================================================================
+
+class BAB64TransactionPool:
+    """
+    Tracks processed transactions to prevent replay attacks.
+
+    A valid transaction can only be accepted ONCE. Submitting the
+    same signed transaction again is rejected as a replay.
+    """
+
+    def __init__(self):
+        self._seen_hashes: set = set()
+
+    def submit(self, tx: BAB64Transaction,
+               sender_verification_key: List[bytes]) -> bool:
+        """
+        Submit a transaction. Returns True if accepted, False if
+        the transaction is invalid or a replay.
+        """
+        if not tx.verify(sender_verification_key):
+            return False
+        if tx.tx_hash in self._seen_hashes:
+            return False  # Replay detected
+        self._seen_hashes.add(tx.tx_hash)
+        return True
+
+    def is_replay(self, tx: BAB64Transaction) -> bool:
+        """Check if a transaction hash has already been processed."""
+        return tx.tx_hash in self._seen_hashes
+
 
 # =============================================================================
 # CONVENIENCE FUNCTIONS
@@ -224,18 +332,21 @@ def create_identity(config: BAB64Config = None) -> BAB64Identity:
 
 
 def sign_transaction(sender: BAB64Identity, receiver: BAB64Identity,
-                     amount: int) -> BAB64Transaction:
+                     amount: int, nonce: int = 0) -> BAB64Transaction:
     """Create and sign a transaction."""
     tx = BAB64Transaction(
         sender=sender.address_hex,
         receiver=receiver.address_hex,
         amount=amount,
+        nonce=nonce,
     )
     tx.sign(sender)
     return tx
 
 
 def verify_transaction(tx: BAB64Transaction,
-                       sender_verification_key: List[bytes]) -> bool:
+                       sender_verification_key: List[bytes] = None) -> bool:
     """Verify a signed transaction."""
-    return tx.verify(sender_verification_key)
+    if sender_verification_key is not None:
+        return tx.verify(sender_verification_key)
+    return tx.verify_self()
