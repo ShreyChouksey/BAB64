@@ -23,7 +23,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from bab64_cash import (
     BAB64Block, BAB64BlockMiner, BAB64Blockchain, BAB64CashTransaction,
-    BlockHeader, TxInput, TxOutput, UTXOSet,
+    BlockHeader, FeePolicy, TxInput, TxOutput, UTXOSet,
     block_reward, build_transaction, merkle_root,
 )
 from bab64_identity import BAB64Identity
@@ -97,14 +97,22 @@ class Mempool:
     def set_utxo_set(self, utxo_set: UTXOSet):
         self._utxo_set = utxo_set
 
-    def add(self, tx: BAB64CashTransaction) -> bool:
-        """Validate and add transaction. Reject duplicates."""
+    def add(self, tx: BAB64CashTransaction,
+            current_height: int = None,
+            enforce_policy: bool = False) -> bool:
+        """Validate and add transaction. Reject duplicates.
+        If enforce_policy=True, also checks relay policy (fee/dust)."""
         if tx.tx_hash in self._transactions:
             return False
         if self._utxo_set:
-            valid, _ = self._utxo_set.validate_transaction(tx)
+            valid, _ = self._utxo_set.validate_transaction(
+                tx, current_height=current_height)
             if not valid:
                 return False
+            if enforce_policy:
+                valid, _ = self._utxo_set.validate_relay_policy(tx)
+                if not valid:
+                    return False
         self._transactions[tx.tx_hash] = tx
         return True
 
@@ -113,11 +121,11 @@ class Mempool:
         self._transactions.pop(tx_hash, None)
 
     def get_by_fee(self) -> List[BAB64CashTransaction]:
-        """Return all transactions sorted by fee descending."""
+        """Return all transactions sorted by fee rate (fee/byte) descending."""
         if not self._utxo_set:
             return list(self._transactions.values())
         txs = list(self._transactions.values())
-        txs.sort(key=lambda t: t.fee(self._utxo_set), reverse=True)
+        txs.sort(key=lambda t: FeePolicy.fee_rate(t, self._utxo_set), reverse=True)
         return txs
 
     def size(self) -> int:
@@ -210,6 +218,7 @@ def _serialize_block(block: BAB64Block) -> dict:
                 "index": out.index,
                 "lock_hash": out.lock_hash,
                 "lock_nonce": out.lock_nonce.hex() if out.lock_nonce else "",
+                "coinbase_height": out.coinbase_height,
             })
         txs.append(tx_dict)
 
@@ -251,6 +260,7 @@ def _deserialize_block(data: dict) -> BAB64Block:
                 index=out_dict["index"],
                 lock_hash=out_dict.get("lock_hash", ""),
                 lock_nonce=bytes.fromhex(nonce_hex) if nonce_hex else b"",
+                coinbase_height=out_dict.get("coinbase_height", -1),
             ))
         tx = BAB64CashTransaction(
             inputs=inputs,
@@ -298,6 +308,7 @@ def _serialize_tx(tx: BAB64CashTransaction) -> dict:
             "index": out.index,
             "lock_hash": out.lock_hash,
             "lock_nonce": out.lock_nonce.hex() if out.lock_nonce else "",
+            "coinbase_height": out.coinbase_height,
         })
     return tx_dict
 
@@ -326,6 +337,7 @@ def _deserialize_tx(data: dict) -> BAB64CashTransaction:
             index=out_dict["index"],
             lock_hash=out_dict.get("lock_hash", ""),
             lock_nonce=bytes.fromhex(nonce_hex) if nonce_hex else b"",
+            coinbase_height=out_dict.get("coinbase_height", -1),
         ))
     tx = BAB64CashTransaction(
         inputs=inputs,

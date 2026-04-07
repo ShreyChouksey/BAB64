@@ -54,10 +54,52 @@ GENESIS_TIMESTAMP = 1712444400  # April 7, 2024
 GENESIS_ADDRESS = "0" * 64      # hardcoded genesis recipient
 GENESIS_MESSAGE = "BAB64/Genesis/2026"
 
+# Economics constants
+DUST_THRESHOLD = 546            # minimum output amount (satoshis)
+COINBASE_MATURITY = 100         # blocks before coinbase can be spent
+MAX_BLOCK_SIZE = 1_000_000      # 1 MB in estimated bytes
+MAX_BLOCK_TRANSACTIONS = 100    # hard cap on tx count (including coinbase)
+
 
 # =============================================================================
 # HASHLOCK — Ownership Proofs
 # =============================================================================
+
+# =============================================================================
+# FEE POLICY
+# =============================================================================
+
+class FeePolicy:
+    """Transaction fee policy for relay and mining."""
+    MINIMUM_RELAY_FEE = 1000    # 1000 satoshis minimum
+    FEE_PER_BYTE = 10           # satoshis per byte of tx
+
+    @staticmethod
+    def tx_size(tx: 'BAB64CashTransaction') -> int:
+        """Estimate transaction size in bytes.
+        Each input: 32 (prev_hash) + 4 (index) + 8192 (Lamport sig) = ~8228
+        Each output: 32 (address) + 8 (amount) + 32 (lock_hash) + 32 (lock_nonce) = ~104
+        Overhead: 32 (tx_hash) + 1 (is_coinbase) = 33
+        """
+        size = 33  # overhead
+        size += len(tx.inputs) * 8228
+        size += len(tx.outputs) * 104
+        return size
+
+    @staticmethod
+    def minimum_fee(tx: 'BAB64CashTransaction') -> int:
+        """Minimum fee based on tx size."""
+        return max(FeePolicy.MINIMUM_RELAY_FEE,
+                   FeePolicy.tx_size(tx) * FeePolicy.FEE_PER_BYTE)
+
+    @staticmethod
+    def fee_rate(tx: 'BAB64CashTransaction', utxo_set: 'UTXOSet') -> float:
+        """Fee per byte — used for mempool priority sorting."""
+        size = FeePolicy.tx_size(tx)
+        if size == 0:
+            return 0.0
+        return tx.fee(utxo_set) / size
+
 
 def compute_lock(image_bytes: bytes) -> Tuple[str, bytes]:
     """
@@ -96,6 +138,7 @@ class TxOutput:
     index: int           # output index within that transaction
     lock_hash: str = ""  # hashlock: SHA256(owner_proof)
     lock_nonce: bytes = field(default_factory=bytes)  # nonce for lock derivation
+    coinbase_height: int = -1  # block height if from coinbase, -1 otherwise
 
 
 @dataclass
@@ -232,6 +275,7 @@ class BAB64CashTransaction:
             index=0,
             lock_hash=lock_hash,
             lock_nonce=lock_nonce,
+            coinbase_height=height,
         ))
         tx.finalize()
         return tx
@@ -279,7 +323,8 @@ class UTXOSet:
             if utxo.recipient == address
         ]
 
-    def validate_transaction(self, tx: BAB64CashTransaction) -> Tuple[bool, str]:
+    def validate_transaction(self, tx: BAB64CashTransaction,
+                             current_height: int = None) -> Tuple[bool, str]:
         """
         Validate a transaction against the UTXO set.
 
@@ -324,6 +369,14 @@ class UTXOSet:
                     f"{inp.prev_tx_hash[:16]}:{inp.prev_index}"
                 )
 
+            # Coinbase maturity check
+            if utxo.coinbase_height >= 0 and current_height is not None:
+                if current_height - utxo.coinbase_height < COINBASE_MATURITY:
+                    return False, (
+                        f"Coinbase output not mature: need {COINBASE_MATURITY} confirmations, "
+                        f"have {current_height - utxo.coinbase_height}"
+                    )
+
             # Check hashlock (ownership proof)
             if utxo.lock_hash:
                 if not inp.owner_proof:
@@ -349,6 +402,27 @@ class UTXOSet:
                 f"Insufficient funds: inputs={input_total}, "
                 f"outputs={output_total}"
             )
+
+        return True, ""
+
+    def validate_relay_policy(self, tx: BAB64CashTransaction) -> Tuple[bool, str]:
+        """
+        Check relay policy rules (fee minimum, dust threshold).
+        These are not consensus rules — they protect the mempool from spam.
+        """
+        if tx.is_coinbase:
+            return True, ""
+
+        # Dust check
+        for out in tx.outputs:
+            if out.amount < DUST_THRESHOLD:
+                return False, f"Output below dust threshold: {out.amount} < {DUST_THRESHOLD}"
+
+        # Minimum relay fee
+        fee = tx.fee(self)
+        min_fee = FeePolicy.minimum_fee(tx)
+        if fee < min_fee:
+            return False, f"Fee below minimum: {fee} < {min_fee}"
 
         return True, ""
 
@@ -631,31 +705,62 @@ class BAB64Blockchain:
             self.utxo_set.apply_transaction(tx)
         return block
 
-    def add_transaction_to_mempool(self, tx: BAB64CashTransaction) -> Tuple[bool, str]:
-        """Validate and add a transaction to the mempool."""
-        valid, err = self.utxo_set.validate_transaction(tx)
+    def add_transaction_to_mempool(self, tx: BAB64CashTransaction,
+                                   enforce_policy: bool = False) -> Tuple[bool, str]:
+        """Validate and add a transaction to the mempool.
+        If enforce_policy=True, also checks relay policy (fee/dust)
+        and coinbase maturity."""
+        current_height = len(self.chain) if enforce_policy else None
+        valid, err = self.utxo_set.validate_transaction(tx, current_height=current_height)
         if not valid:
             return False, err
+        if enforce_policy:
+            valid, err = self.utxo_set.validate_relay_policy(tx)
+            if not valid:
+                return False, err
         self.mempool.append(tx)
         return True, ""
 
     def mine_block(self, miner: BAB64Identity = None,
                    timestamp: float = None) -> Optional[BAB64Block]:
-        """Mine a new block with mempool transactions."""
+        """Mine a new block with mempool transactions, respecting limits."""
         m = miner or self.miner
         addr = m.address_hex if m else self.miner_address
         img = m._image_bytes if m else None
         height = len(self.chain)
         prev_hash = self.chain[-1].block_hash if self.chain else "0" * 64
 
-        # Calculate total fees
-        fees = sum(tx.fee(self.utxo_set) for tx in self.mempool)
+        # Select transactions by fee_rate descending, respecting limits
+        sorted_mempool = sorted(
+            self.mempool,
+            key=lambda t: FeePolicy.fee_rate(t, self.utxo_set),
+            reverse=True,
+        )
+
+        selected = []
+        # Reserve space for coinbase (1 tx slot + its size)
+        coinbase_size = 33 + 104  # overhead + 1 output, no inputs
+        block_size = coinbase_size
+        tx_count = 1  # coinbase
+
+        for tx in sorted_mempool:
+            tx_sz = FeePolicy.tx_size(tx)
+            if tx_count + 1 > MAX_BLOCK_TRANSACTIONS:
+                break
+            if block_size + tx_sz > MAX_BLOCK_SIZE:
+                break
+            selected.append(tx)
+            block_size += tx_sz
+            tx_count += 1
+
+        # Calculate total fees from selected transactions
+        fees = sum(tx.fee(self.utxo_set) for tx in selected)
 
         # Coinbase first
         coinbase = BAB64CashTransaction.create_coinbase(
             addr, height, fees, image_bytes=img
         )
-        transactions = [coinbase] + list(self.mempool)
+        transactions = [coinbase] + selected
 
         # Use provided timestamp or current time
         tx_hashes = [tx.tx_hash for tx in transactions]
@@ -691,12 +796,27 @@ class BAB64Blockchain:
             self.utxo_set.add_outputs(tx)
 
         self.chain.append(block)
-        self.mempool.clear()
+        # Remove only selected transactions from mempool
+        selected_hashes = {tx.tx_hash for tx in selected}
+        self.mempool = [tx for tx in self.mempool if tx.tx_hash not in selected_hashes]
         return block
 
     def get_balance(self, address: str) -> int:
         """Query balance from the UTXO set."""
         return self.utxo_set.balance(address)
+
+    def total_supply(self) -> int:
+        """Sum of all coinbase rewards across all blocks."""
+        total = 0
+        for block in self.chain:
+            for tx in block.transactions:
+                if tx.is_coinbase:
+                    total += sum(out.amount for out in tx.outputs)
+        return total
+
+    def verify_supply_cap(self) -> bool:
+        """Ensure total supply <= MAX_SUPPLY."""
+        return self.total_supply() <= MAX_SUPPLY
 
     def median_time_past(self, chain: List[BAB64Block] = None) -> float:
         """Median timestamp of the last 11 blocks (or fewer if chain is short)."""
@@ -803,6 +923,19 @@ class BAB64Blockchain:
                 return False, "Duplicate transaction in block"
             seen_tx.add(tx.tx_hash)
 
+        # Block size limits
+        if len(block.transactions) > MAX_BLOCK_TRANSACTIONS:
+            return False, (
+                f"Block exceeds transaction count limit: "
+                f"{len(block.transactions)} > {MAX_BLOCK_TRANSACTIONS}"
+            )
+
+        total_block_size = sum(FeePolicy.tx_size(tx) for tx in block.transactions)
+        if total_block_size > MAX_BLOCK_SIZE:
+            return False, (
+                f"Block exceeds size limit: {total_block_size} > {MAX_BLOCK_SIZE}"
+            )
+
         # Rules 5, 6: Coinbase checks
         if not block.transactions:
             return False, "Block has no transactions"
@@ -828,7 +961,7 @@ class BAB64Blockchain:
 
         # Rule 7: Validate non-coinbase transactions
         for tx in block.transactions[1:]:
-            valid, err = us.validate_transaction(tx)
+            valid, err = us.validate_transaction(tx, current_height=expected_height)
             if not valid:
                 return False, f"Invalid transaction: {err}"
 
