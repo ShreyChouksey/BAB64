@@ -701,6 +701,7 @@ class BAB64Blockchain:
         self.miner_address = miner_address or (miner.address_hex if miner else "")
         self.storage = storage
         self.mempool: List[BAB64CashTransaction] = []
+        self._mempool_spent: set = set()  # (tx_hash, index) claimed by mempool txns
 
         if storage:
             self.chain, self.utxo_set = storage.load_state()
@@ -806,6 +807,14 @@ class BAB64Blockchain:
             valid, err = self.utxo_set.validate_relay_policy(tx)
             if not valid:
                 return False, err
+        # Reject if any input is already claimed by another mempool transaction
+        for inp in tx.inputs:
+            key = (inp.prev_tx_hash, inp.prev_index)
+            if key in self._mempool_spent:
+                return False, f"Input already spent by mempool transaction: {key}"
+        # Track claimed inputs
+        for inp in tx.inputs:
+            self._mempool_spent.add((inp.prev_tx_hash, inp.prev_index))
         self.mempool.append(tx)
         return True, ""
 
@@ -830,6 +839,7 @@ class BAB64Blockchain:
         coinbase_size = 33 + 104  # overhead + 1 output, no inputs
         block_size = coinbase_size
         tx_count = 1  # coinbase
+        consumed_utxos: set = set()  # track inputs claimed by selected txns
 
         for tx in sorted_mempool:
             tx_sz = FeePolicy.tx_size(tx)
@@ -837,7 +847,12 @@ class BAB64Blockchain:
                 break
             if block_size + tx_sz > MAX_BLOCK_SIZE:
                 break
+            # Skip transactions whose inputs conflict with already-selected ones
+            tx_inputs = {(inp.prev_tx_hash, inp.prev_index) for inp in tx.inputs}
+            if tx_inputs & consumed_utxos:
+                continue
             selected.append(tx)
+            consumed_utxos |= tx_inputs
             block_size += tx_sz
             tx_count += 1
 
@@ -886,9 +901,26 @@ class BAB64Blockchain:
         self.chain.append(block)
         if self.storage:
             self.storage.blockchain.save_block(block)
-        # Remove only selected transactions from mempool
+        # Remove selected transactions from mempool and clean up spent tracking
         selected_hashes = {tx.tx_hash for tx in selected}
-        self.mempool = [tx for tx in self.mempool if tx.tx_hash not in selected_hashes]
+        new_mempool = []
+        for tx in self.mempool:
+            if tx.tx_hash in selected_hashes:
+                # Release claimed inputs
+                for inp in tx.inputs:
+                    self._mempool_spent.discard((inp.prev_tx_hash, inp.prev_index))
+            else:
+                # Also evict any tx whose inputs were just spent by the block
+                still_valid = True
+                for inp in tx.inputs:
+                    if self.utxo_set.get(inp.prev_tx_hash, inp.prev_index) is None:
+                        still_valid = False
+                        for inp2 in tx.inputs:
+                            self._mempool_spent.discard((inp2.prev_tx_hash, inp2.prev_index))
+                        break
+                if still_valid:
+                    new_mempool.append(tx)
+        self.mempool = new_mempool
         return block
 
     def get_balance(self, address: str) -> int:

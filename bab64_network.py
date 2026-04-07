@@ -92,6 +92,7 @@ class Mempool:
 
     def __init__(self, utxo_set: UTXOSet = None):
         self._transactions: Dict[str, BAB64CashTransaction] = {}
+        self._spent_inputs: Set[Tuple[str, int]] = set()
         self._utxo_set = utxo_set
 
     def set_utxo_set(self, utxo_set: UTXOSet):
@@ -113,12 +114,22 @@ class Mempool:
                 valid, _ = self._utxo_set.validate_relay_policy(tx)
                 if not valid:
                     return False
+        # Reject if any input is already claimed by another mempool transaction
+        for inp in tx.inputs:
+            if (inp.prev_tx_hash, inp.prev_index) in self._spent_inputs:
+                return False
+        # Track claimed inputs
+        for inp in tx.inputs:
+            self._spent_inputs.add((inp.prev_tx_hash, inp.prev_index))
         self._transactions[tx.tx_hash] = tx
         return True
 
     def remove(self, tx_hash: str):
         """Remove a transaction by hash."""
-        self._transactions.pop(tx_hash, None)
+        tx = self._transactions.pop(tx_hash, None)
+        if tx:
+            for inp in tx.inputs:
+                self._spent_inputs.discard((inp.prev_tx_hash, inp.prev_index))
 
     def get_by_fee(self) -> List[BAB64CashTransaction]:
         """Return all transactions sorted by fee rate (fee/byte) descending."""
@@ -137,7 +148,10 @@ class Mempool:
     def clear_confirmed(self, block: BAB64Block):
         """Remove transactions that were included in a block."""
         for tx in block.transactions:
-            self._transactions.pop(tx.tx_hash, None)
+            removed = self._transactions.pop(tx.tx_hash, None)
+            if removed:
+                for inp in removed.inputs:
+                    self._spent_inputs.discard((inp.prev_tx_hash, inp.prev_index))
 
     def get_transactions(self, max_count: int = None) -> List[BAB64CashTransaction]:
         """Get top transactions by fee, up to max_count."""
