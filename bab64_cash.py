@@ -36,6 +36,10 @@ from typing import Dict, List, Optional, Tuple
 
 from bab64_identity import BAB64Identity, LamportKeyPair
 from bab64_engine import BAB64Config as EngineConfig, BabelRenderer, ImageHash
+from bab64_signatures import (
+    BAB64IBSTIdentity, BAB64WOTS, BAB64MerkleTree,
+    IBSTSignature, ImageChainFunction,
+)
 
 # Activate C extension for BAB64 hashing if available
 try:
@@ -48,6 +52,18 @@ except ImportError:
 _engine_config = EngineConfig()
 _renderer = BabelRenderer(_engine_config)
 _hasher = ImageHash(_engine_config)
+
+# Cache of IBST identities, keyed by BAB64 address hex.
+# Avoids re-generating 1,024 WOTS+ keys on every sign.
+_ibst_cache: Dict[str, BAB64IBSTIdentity] = {}
+
+
+def _get_ibst(identity: BAB64Identity) -> BAB64IBSTIdentity:
+    """Get or create the cached BAB64IBSTIdentity for a BAB64Identity."""
+    addr = identity.address_hex
+    if addr not in _ibst_cache:
+        _ibst_cache[addr] = BAB64IBSTIdentity(identity._private_key)
+    return _ibst_cache[addr]
 
 
 # =============================================================================
@@ -90,12 +106,14 @@ class FeePolicy:
     @staticmethod
     def tx_size(tx: 'BAB64CashTransaction') -> int:
         """Estimate transaction size in bytes.
-        Each input: 32 (prev_hash) + 4 (index) + 8192 (Lamport sig) = ~8228
+        Each input: 32 (prev_hash) + 4 (index) + 2144 (WOTS+ sig) + 2144 (WOTS+ pk)
+                    + 320 (auth_path) + 4 (leaf_index) + 32 (merkle_root)
+                    + image_bytes (~12288) = ~16966
         Each output: 32 (address) + 8 (amount) + 32 (lock_hash) + 32 (lock_nonce) = ~104
         Overhead: 32 (tx_hash) + 1 (is_coinbase) = 33
         """
         size = 33  # overhead
-        size += len(tx.inputs) * 8228
+        size += len(tx.inputs) * 16966
         size += len(tx.outputs) * 104
         return size
 
@@ -159,9 +177,13 @@ class TxInput:
     """A reference to a UTXO being spent."""
     prev_tx_hash: str   # points to a TxOutput
     prev_index: int     # which output of that transaction
-    signature: List[bytes] = field(default_factory=list)
-    verification_key: List[bytes] = field(default_factory=list)
+    signature: List[bytes] = field(default_factory=list)        # WOTS+ sig (67 x 32B)
+    verification_key: List[bytes] = field(default_factory=list)  # WOTS+ pk (67 x 32B)
     owner_proof: bytes = field(default_factory=bytes)  # proves image knowledge
+    ibst_leaf_index: int = 0
+    ibst_auth_path: List[bytes] = field(default_factory=list)    # Merkle path (10 x 32B)
+    ibst_merkle_root: bytes = field(default_factory=bytes)       # tree root (32B)
+    ibst_image_bytes: bytes = field(default_factory=bytes)       # signer's image (for chain fn)
 
 
 # =============================================================================
@@ -238,15 +260,22 @@ class BAB64CashTransaction:
     def sign_input(self, input_index: int, identity: BAB64Identity,
                    lock_nonce: bytes = None):
         """
-        Sign a specific input with the owner's identity.
+        Sign a specific input with the owner's IBST identity.
 
+        Uses WOTS+ signature from the Merkle tree of 1,024 keys.
         If lock_nonce is provided, also computes the owner_proof
         needed to pass the hashlock check.
         """
         payload = self.signing_payload()
-        sig = identity.sign(payload)
-        self.inputs[input_index].signature = sig.raw
-        self.inputs[input_index].verification_key = sig.verification_key
+        ibst = _get_ibst(identity)
+        ibst_sig = ibst.sign(payload)
+        inp = self.inputs[input_index]
+        inp.signature = ibst_sig.wots_signature
+        inp.verification_key = ibst_sig.wots_public_key
+        inp.ibst_leaf_index = ibst_sig.leaf_index
+        inp.ibst_auth_path = ibst_sig.auth_path
+        inp.ibst_merkle_root = ibst.merkle_root
+        inp.ibst_image_bytes = identity._image_bytes
         if lock_nonce:
             self.inputs[input_index].owner_proof = compute_unlock(
                 identity._image_bytes, lock_nonce
@@ -397,14 +426,24 @@ class UTXOSet:
                 if not verify_lock(inp.owner_proof, utxo.lock_hash):
                     return False, "Invalid owner proof — not the UTXO owner"
 
-            # Verify signature
+            # Verify IBST signature (WOTS+ + Merkle path)
             if not inp.signature or not inp.verification_key:
                 return False, "Input missing signature"
+            if not inp.ibst_image_bytes or not inp.ibst_merkle_root:
+                return False, "Input missing IBST verification data"
 
             payload = tx.signing_payload()
-            if not LamportKeyPair.verify(payload, inp.signature,
-                                         inp.verification_key):
-                return False, "Invalid signature"
+            ibst_sig = IBSTSignature(
+                wots_signature=inp.signature,
+                wots_public_key=inp.verification_key,
+                leaf_index=inp.ibst_leaf_index,
+                auth_path=inp.ibst_auth_path,
+            )
+            if not BAB64IBSTIdentity.verify_standalone(
+                payload, ibst_sig, inp.ibst_merkle_root,
+                inp.ibst_image_bytes,
+            ):
+                return False, "Invalid IBST signature"
 
             input_total += utxo.amount
 

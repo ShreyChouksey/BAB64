@@ -299,6 +299,10 @@ def _serialize_tx(tx: BAB64CashTransaction) -> dict:
             "signature": [b.hex() if isinstance(b, bytes) else b for b in inp.signature],
             "verification_key": [b.hex() if isinstance(b, bytes) else b for b in inp.verification_key],
             "owner_proof": inp.owner_proof.hex() if inp.owner_proof else "",
+            "ibst_leaf_index": inp.ibst_leaf_index,
+            "ibst_auth_path": [b.hex() if isinstance(b, bytes) else b for b in inp.ibst_auth_path],
+            "ibst_merkle_root": inp.ibst_merkle_root.hex() if inp.ibst_merkle_root else "",
+            "ibst_image_bytes": inp.ibst_image_bytes.hex() if inp.ibst_image_bytes else "",
         })
     for out in tx.outputs:
         tx_dict["outputs"].append({
@@ -320,12 +324,20 @@ def _deserialize_tx(data: dict) -> BAB64CashTransaction:
         sig = [bytes.fromhex(s) if isinstance(s, str) else s for s in inp_dict["signature"]]
         vk = [bytes.fromhex(k) if isinstance(k, str) else k for k in inp_dict["verification_key"]]
         proof = bytes.fromhex(inp_dict["owner_proof"]) if inp_dict["owner_proof"] else b""
+        auth_path_raw = inp_dict.get("ibst_auth_path", [])
+        auth_path = [bytes.fromhex(h) if isinstance(h, str) else h for h in auth_path_raw]
+        mr_hex = inp_dict.get("ibst_merkle_root", "")
+        img_hex = inp_dict.get("ibst_image_bytes", "")
         inputs.append(TxInput(
             prev_tx_hash=inp_dict["prev_tx_hash"],
             prev_index=inp_dict["prev_index"],
             signature=sig,
             verification_key=vk,
             owner_proof=proof,
+            ibst_leaf_index=inp_dict.get("ibst_leaf_index", 0),
+            ibst_auth_path=auth_path,
+            ibst_merkle_root=bytes.fromhex(mr_hex) if mr_hex else b"",
+            ibst_image_bytes=bytes.fromhex(img_hex) if img_hex else b"",
         ))
     outputs = []
     for out_dict in data["outputs"]:

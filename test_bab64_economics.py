@@ -43,7 +43,7 @@ def fund_address(bc, miner, recipient, amount, fee=None):
     Returns the transaction."""
     if fee is None:
         # Estimate fee: 1 input + 2 outputs
-        fee = FeePolicy.MINIMUM_RELAY_FEE + FeePolicy.FEE_PER_BYTE * (8228 + 208 + 33)
+        fee = FeePolicy.MINIMUM_RELAY_FEE + FeePolicy.FEE_PER_BYTE * (16966 + 208 + 33)
     tx = build_transaction(miner, recipient, amount, bc.utxo_set, fee=fee)
     return tx
 
@@ -66,16 +66,16 @@ class TestFeePolicy(unittest.TestCase):
         tx = BAB64CashTransaction()
         tx.inputs = [TxInput("a" * 64, 0)]
         tx.outputs = [TxOutput("b" * 64, 1000, "", 0)]
-        # 33 overhead + 1*8228 + 1*104 = 8365
-        self.assertEqual(FeePolicy.tx_size(tx), 8365)
+        # 33 overhead + 1*16966 + 1*104 = 17103
+        self.assertEqual(FeePolicy.tx_size(tx), 17103)
 
     def test_tx_size_multiple_io(self):
         """tx_size scales with number of inputs and outputs."""
         tx = BAB64CashTransaction()
         tx.inputs = [TxInput("a" * 64, i) for i in range(3)]
         tx.outputs = [TxOutput("b" * 64, 1000, "", i) for i in range(2)]
-        # 33 + 3*8228 + 2*104 = 33 + 24684 + 208 = 24925
-        self.assertEqual(FeePolicy.tx_size(tx), 24925)
+        # 33 + 3*16966 + 2*104 = 33 + 50898 + 208 = 51139
+        self.assertEqual(FeePolicy.tx_size(tx), 51139)
 
     def test_minimum_fee_at_least_relay_fee(self):
         """Minimum fee is at least MINIMUM_RELAY_FEE."""
@@ -238,13 +238,13 @@ class TestBlockSizeLimit(unittest.TestCase):
         coinbase = BAB64CashTransaction.create_coinbase(
             miner.address_hex, height, 0, miner._image_bytes
         )
-        # Each tx with 1 input ~ 8365 bytes. MAX_BLOCK_SIZE / 8365 ~ 119 txs
-        # MAX_BLOCK_TRANSACTIONS = 100, so tx count will hit first
+        # Each tx with 1 input ~ 17103 bytes. MAX_BLOCK_SIZE / 17103 ~ 58 txs
+        # MAX_BLOCK_TRANSACTIONS = 100, so size limit will hit first
         # To test size, we need big transactions (many inputs)
         big_txs = []
         for i in range(15):
             tx = BAB64CashTransaction()
-            # 10 inputs each = 82280 bytes. 15 * 82280 > 1MB
+            # 10 inputs each = 169660+33+104 = 169797 bytes. 15 * 169797 > 1MB
             tx.inputs = [TxInput(f"{i:064x}", j) for j in range(10)]
             tx.outputs = [TxOutput("a" * 64, 1000, "", 0)]
             tx.tx_hash = hashlib.sha256(f"fake_{i}".encode()).hexdigest()
