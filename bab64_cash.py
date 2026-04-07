@@ -694,13 +694,19 @@ class BAB64Blockchain:
 
     def __init__(self, difficulty: int = 4,
                  miner: BAB64Identity = None,
-                 miner_address: str = ""):
+                 miner_address: str = "",
+                 storage=None):
         self.difficulty = difficulty
         self.miner = miner
         self.miner_address = miner_address or (miner.address_hex if miner else "")
-        self.chain: List[BAB64Block] = []
-        self.utxo_set = UTXOSet()
+        self.storage = storage
         self.mempool: List[BAB64CashTransaction] = []
+
+        if storage:
+            self.chain, self.utxo_set = storage.load_state()
+        else:
+            self.chain: List[BAB64Block] = []
+            self.utxo_set = UTXOSet()
 
     def _miner_image(self) -> Optional[bytes]:
         """Get the miner's image bytes for hashlock creation."""
@@ -878,6 +884,8 @@ class BAB64Blockchain:
             self.utxo_set.add_outputs(tx)
 
         self.chain.append(block)
+        if self.storage:
+            self.storage.blockchain.save_block(block)
         # Remove only selected transactions from mempool
         selected_hashes = {tx.tx_hash for tx in selected}
         self.mempool = [tx for tx in self.mempool if tx.tx_hash not in selected_hashes]
