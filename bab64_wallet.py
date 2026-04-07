@@ -23,24 +23,37 @@ from bab64_identity import BAB64Identity
 from bab64_storage import BAB64Storage
 
 
+def _add_common_args(parser, with_defaults=True):
+    """Add --data-dir and --passphrase to a parser.
+
+    When with_defaults=False, use SUPPRESS so subparser copies don't
+    overwrite values already parsed by the parent parser.
+    """
+    default_dir = "./bab64_data" if with_defaults else argparse.SUPPRESS
+    default_pass = None if with_defaults else argparse.SUPPRESS
+    parser.add_argument("--data-dir", default=default_dir,
+                        help="Data directory for SQLite DBs (default: ./bab64_data)")
+    parser.add_argument("--passphrase", default=default_pass,
+                        help="Passphrase for wallet encryption (default: bab64default)")
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="BAB64 Wallet — manage identities and send coins",
     )
-    parser.add_argument("--data-dir", default="./bab64_data",
-                        help="Data directory for SQLite DBs (default: ./bab64_data)")
-    parser.add_argument("--passphrase", default=None,
-                        help="Passphrase for wallet encryption (default: bab64default)")
+    _add_common_args(parser)
 
     sub = parser.add_subparsers(dest="command")
 
     # create
-    sub.add_parser("create", help="Create a new identity, print address")
+    create = sub.add_parser("create", help="Create a new identity, print address")
+    _add_common_args(create, with_defaults=False)
 
     # balance
     bal = sub.add_parser("balance", help="Show balance for an address")
     bal.add_argument("--address", default="",
                      help="Address to check (default: all)")
+    _add_common_args(bal, with_defaults=False)
 
     # send
     send = sub.add_parser("send", help="Build, sign, and submit a transaction")
@@ -51,12 +64,15 @@ def parse_args(argv=None):
                       help="Fee in BAB64 coins (default: 0.001)")
     send.add_argument("--from", dest="from_addr", default="",
                       help="Sender address (default: first wallet)")
+    _add_common_args(send, with_defaults=False)
 
     # list
-    sub.add_parser("list", help="List all wallet addresses")
+    lst = sub.add_parser("list", help="List all wallet addresses")
+    _add_common_args(lst, with_defaults=False)
 
     # info
-    sub.add_parser("info", help="Show node info: chain height, supply, etc.")
+    info = sub.add_parser("info", help="Show node info: chain height, supply, etc.")
+    _add_common_args(info, with_defaults=False)
 
     return parser.parse_args(argv)
 

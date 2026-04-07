@@ -603,6 +603,11 @@ class BAB64Node:
         if event:
             event.set()
 
+        # Trigger Initial Block Download if peer is ahead
+        my_height = len(self.blockchain.chain) - 1
+        if peer.best_height > my_height:
+            asyncio.create_task(self.sync_with_peer(peer))
+
     async def _handle_inv(self, peer: Peer, payload: dict):
         """Handle INV: check if we need the announced items."""
         items = payload.get("items", [])
@@ -691,6 +696,10 @@ class BAB64Node:
         self.blockchain.chain.append(block)
         self.known_blocks.add(block.block_hash)
         self.mempool.clear_confirmed(block)
+
+        # Persist to storage
+        if self.blockchain.storage:
+            self.blockchain.storage.blockchain.save_block(block)
 
         # Relay to other peers
         inv_msg = self._make_message(INV, {
