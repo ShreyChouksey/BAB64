@@ -694,13 +694,79 @@ class BAB64Node:
 
         # Validate the block
         expected_height = len(self.blockchain.chain)
-        if block.index != expected_height:
-            # Might be for IBD — check requested blocks
+
+        if block.index > expected_height:
+            # We're behind — resolve pending IBD request or trigger sync
+            fut = self._requested_blocks.pop(block.block_hash, None)
+            if fut and not fut.done():
+                fut.set_result(block)
+            else:
+                asyncio.create_task(self.sync_with_peer(peer))
+            return
+
+        if block.index < expected_height - 1:
+            # Very old block — resolve pending request only
             fut = self._requested_blocks.pop(block.block_hash, None)
             if fut and not fut.done():
                 fut.set_result(block)
             return
 
+        if block.index == expected_height - 1 and len(self.blockchain.chain) >= 2:
+            # Competing block at same height as our tip — fork resolution
+            parent_hash = self.blockchain.chain[-2].block_hash
+            if block.previous_hash != parent_hash:
+                # Different fork point, can't compare — need IBD
+                fut = self._requested_blocks.pop(block.block_hash, None)
+                if fut and not fut.done():
+                    fut.set_result(block)
+                return
+
+            valid, err = self.blockchain.validate_block(block, parent_hash)
+            if not valid:
+                return
+
+            our_tip = self.blockchain.chain[-1]
+            # Higher difficulty wins; same difficulty: lower hash wins
+            replace = (block.difficulty > our_tip.difficulty or
+                       (block.difficulty == our_tip.difficulty and
+                        block.block_hash < our_tip.block_hash))
+            if not replace:
+                return  # keep our tip
+
+            # Undo our tip's transactions from the in-memory UTXO set
+            for tx in reversed(our_tip.transactions):
+                if not tx.is_coinbase:
+                    # Restore spent inputs
+                    for inp in tx.inputs:
+                        # Re-add the output that was spent
+                        # We need to find it in the prior chain state;
+                        # scan the chain for the output
+                        for prev_block in self.blockchain.chain:
+                            for prev_tx in prev_block.transactions:
+                                if prev_tx.tx_hash == inp.prev_tx_hash:
+                                    for out in prev_tx.outputs:
+                                        if out.index == inp.prev_index:
+                                            self.blockchain.utxo_set._utxos[
+                                                (inp.prev_tx_hash, inp.prev_index)] = out
+                # Remove outputs added by this tx
+                for out in tx.outputs:
+                    self.blockchain.utxo_set._utxos.pop(
+                        (out.tx_hash, out.index), None)
+
+            # Remove our tip
+            self.blockchain.chain.pop()
+
+            # Now fall through to apply the new block as normal
+            # (expected_height is now correct again)
+
+        elif block.index != expected_height:
+            # Doesn't match any case we handle
+            fut = self._requested_blocks.pop(block.block_hash, None)
+            if fut and not fut.done():
+                fut.set_result(block)
+            return
+
+        # --- Normal append: block extends our chain tip ---
         expected_prev = (
             self.blockchain.chain[-1].block_hash
             if self.blockchain.chain else "0" * 64
@@ -727,6 +793,14 @@ class BAB64Node:
         # Persist to storage
         if self.blockchain.storage:
             self.blockchain.storage.blockchain.save_block(block)
+            # Incrementally update UTXO storage
+            for tx in block.transactions:
+                if not tx.is_coinbase:
+                    for inp in tx.inputs:
+                        self.blockchain.storage.utxos.spend_utxo(
+                            inp.prev_tx_hash, inp.prev_index)
+                for out in tx.outputs:
+                    self.blockchain.storage.utxos.save_utxo(out)
 
         # Relay to other peers
         inv_msg = self._make_message(INV, {

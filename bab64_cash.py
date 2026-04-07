@@ -901,6 +901,13 @@ class BAB64Blockchain:
         self.chain.append(block)
         if self.storage:
             self.storage.blockchain.save_block(block)
+            # Incrementally update UTXO storage
+            for tx in transactions:
+                if not tx.is_coinbase:
+                    for inp in tx.inputs:
+                        self.storage.utxos.spend_utxo(inp.prev_tx_hash, inp.prev_index)
+                for out in tx.outputs:
+                    self.storage.utxos.save_utxo(out)
         # Remove selected transactions from mempool and clean up spent tracking
         selected_hashes = {tx.tx_hash for tx in selected}
         new_mempool = []

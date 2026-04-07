@@ -109,13 +109,60 @@ async def mining_loop(node: BAB64Node, blockchain: BAB64Blockchain,
     """Continuously mine blocks and broadcast them."""
     while True:
         try:
+            # Record chain height before mining
+            height_before = len(blockchain.chain)
+
             block = await asyncio.get_event_loop().run_in_executor(
                 None, _mine_block_sync, blockchain, identity,
             )
             if block:
+                # mine_block() already appended block to chain and
+                # applied UTXO changes. Check if a peer's block was
+                # also accepted via _handle_block during mining,
+                # making our block stale (chain tip is not our block).
+                height_after = len(blockchain.chain)
+                is_stale = (
+                    height_after != height_before + 1 or
+                    blockchain.chain[-1].block_hash != block.block_hash
+                )
+                if is_stale:
+                    # Undo the UTXO changes mine_block() applied.
+                    for tx in reversed(block.transactions):
+                        for out in tx.outputs:
+                            blockchain.utxo_set._utxos.pop(
+                                (out.tx_hash, out.index), None)
+                        if not tx.is_coinbase:
+                            for inp in tx.inputs:
+                                for prev_blk in blockchain.chain:
+                                    for prev_tx in prev_blk.transactions:
+                                        if prev_tx.tx_hash == inp.prev_tx_hash:
+                                            for o in prev_tx.outputs:
+                                                if o.index == inp.prev_index:
+                                                    blockchain.utxo_set._utxos[
+                                                        (inp.prev_tx_hash, inp.prev_index)] = o
+                    # Remove our block from chain if it's there
+                    blockchain.chain = [
+                        b for b in blockchain.chain
+                        if b.block_hash != block.block_hash
+                    ]
+                    logger.info(
+                        "Block %d stale (chain advanced while mining), discarding",
+                        block.index,
+                    )
+                    await asyncio.sleep(0.1)
+                    continue
+
                 # Persist from the main thread (safe for SQLite)
                 if blockchain.storage:
                     blockchain.storage.blockchain.save_block(block)
+                    # Incrementally update UTXO storage
+                    for tx in block.transactions:
+                        if not tx.is_coinbase:
+                            for inp in tx.inputs:
+                                blockchain.storage.utxos.spend_utxo(
+                                    inp.prev_tx_hash, inp.prev_index)
+                        for out in tx.outputs:
+                            blockchain.storage.utxos.save_utxo(out)
 
                 node.known_blocks.add(block.block_hash)
                 node.mempool.clear_confirmed(block)
