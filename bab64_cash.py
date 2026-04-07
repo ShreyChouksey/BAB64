@@ -35,6 +35,19 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from bab64_identity import BAB64Identity, LamportKeyPair
+from bab64_engine import BAB64Config as EngineConfig, BabelRenderer, ImageHash
+
+# Activate C extension for BAB64 hashing if available
+try:
+    import bab64_fast
+    _has_c_extension = bab64_fast.is_available()
+except ImportError:
+    _has_c_extension = False
+
+# Shared engine objects (initialized once, reused for all mining/verification)
+_engine_config = EngineConfig()
+_renderer = BabelRenderer(_engine_config)
+_hasher = ImageHash(_engine_config)
 
 
 # =============================================================================
@@ -500,17 +513,47 @@ class BAB64Block:
 
 
 class BAB64BlockMiner:
-    """Mines blocks by finding nonces that meet the difficulty target."""
+    """
+    Mines blocks using BAB64 self-referential image hashing.
+
+    For each nonce candidate:
+      1. Build header string from (index, prev_hash, timestamp, merkle_root, difficulty, nonce)
+      2. SHA-256 the header to get a 32-byte seed
+      3. BabelRenderer generates a 64x64 image from that seed
+      4. Derive hash parameters (S-box, round constants, rotations, initial state) FROM the image
+      5. Hash the image using its OWN derived function (self-referential)
+      6. Check if the BAB64 hash meets the difficulty target
+
+    Verification costs exactly ONE mining attempt — regenerate image, re-derive, re-hash.
+    """
+
+    @staticmethod
+    def _header_seed(index: int, previous_hash: str,
+                     timestamp: float, merkle_root_hash: str,
+                     nonce: int, difficulty: int) -> bytes:
+        """Build a 32-byte seed from block header fields."""
+        header = (
+            f"{index}:{previous_hash}:{timestamp}:"
+            f"{merkle_root_hash}:{nonce}:{difficulty}"
+        )
+        return hashlib.sha256(header.encode()).digest()
 
     @staticmethod
     def compute_block_hash(index: int, previous_hash: str,
                            timestamp: float, merkle_root_hash: str,
                            nonce: int, difficulty: int) -> str:
-        header = (
-            f"{index}:{previous_hash}:{timestamp}:"
-            f"{merkle_root_hash}:{nonce}:{difficulty}"
+        """
+        Compute block hash using BAB64 self-referential image hashing.
+
+        header → seed → image → derive H_I from image → H_I(image) → hash
+        """
+        seed = BAB64BlockMiner._header_seed(
+            index, previous_hash, timestamp, merkle_root_hash,
+            nonce, difficulty
         )
-        return hashlib.sha256(header.encode()).hexdigest()
+        image = _renderer.render(seed)
+        bab64_hash = _hasher.hash_image(image)
+        return bab64_hash.hex()
 
     @staticmethod
     def meets_difficulty(block_hash: str, difficulty: int) -> bool:
@@ -526,7 +569,7 @@ class BAB64BlockMiner:
                    transactions: List[BAB64CashTransaction],
                    difficulty: int,
                    max_nonces: int = 10_000_000) -> Optional[BAB64Block]:
-        """Mine a block by finding a valid nonce."""
+        """Mine a block by finding a nonce whose BAB64 hash meets difficulty."""
         tx_hashes = [tx.tx_hash for tx in transactions]
         mr = merkle_root(tx_hashes)
         timestamp = time.time()
