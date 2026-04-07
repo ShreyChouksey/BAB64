@@ -26,8 +26,10 @@ Supply:
 Author: Shrey (concept) + Claude (implementation)
 """
 
+import copy
 import hashlib
 import os
+import statistics
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -43,6 +45,14 @@ COIN = 100_000_000          # 1 BAB64 = 100,000,000 satoshis
 INITIAL_REWARD = 50 * COIN  # 50 BAB64 per block
 HALVING_INTERVAL = 210_000  # blocks between halvings
 MAX_SUPPLY = 21_000_000 * COIN
+
+# Consensus constants
+TARGET_BLOCK_TIME = 60          # 60 seconds target
+ADJUSTMENT_INTERVAL = 10        # adjust every 10 blocks
+MAX_FUTURE_BLOCK_TIME = 7200    # 2 hours
+GENESIS_TIMESTAMP = 1712444400  # April 7, 2024
+GENESIS_ADDRESS = "0" * 64      # hardcoded genesis recipient
+GENESIS_MESSAGE = "BAB64/Genesis/2026"
 
 
 # =============================================================================
@@ -379,6 +389,18 @@ def merkle_root(tx_hashes: List[str]) -> str:
 # =============================================================================
 
 @dataclass
+class BlockHeader:
+    """Block header — separates metadata from body for efficient verification."""
+    index: int
+    previous_hash: str
+    timestamp: float
+    merkle_root: str
+    difficulty: int
+    nonce: int
+    block_hash: str
+
+
+@dataclass
 class BAB64Block:
     """A block in the BAB64 Cash blockchain."""
     index: int
@@ -389,6 +411,18 @@ class BAB64Block:
     nonce: int
     difficulty: int
     block_hash: str
+
+    def header(self) -> BlockHeader:
+        """Extract the block header for lightweight verification."""
+        return BlockHeader(
+            index=self.index,
+            previous_hash=self.previous_hash,
+            timestamp=self.timestamp,
+            merkle_root=self.merkle_root_hash,
+            difficulty=self.difficulty,
+            nonce=self.nonce,
+            block_hash=self.block_hash,
+        )
 
 
 class BAB64BlockMiner:
@@ -442,7 +476,57 @@ class BAB64BlockMiner:
 
 
 # =============================================================================
-# COMPONENT 7 — BLOCKCHAIN
+# COMPONENT 7 — CHAIN SELECTION
+# =============================================================================
+
+class ChainSelector:
+    """Select the best chain among competing forks."""
+
+    @staticmethod
+    def cumulative_work(chain: List[BAB64Block]) -> int:
+        """Sum of 2^difficulty for each block."""
+        return sum(2 ** block.difficulty for block in chain)
+
+    @staticmethod
+    def select_chain(chain_a: List[BAB64Block], chain_b: List[BAB64Block],
+                     utxo_set: UTXOSet) -> List[BAB64Block]:
+        """Return the chain with more cumulative work, if it's fully valid."""
+        work_a = ChainSelector.cumulative_work(chain_a)
+        work_b = ChainSelector.cumulative_work(chain_b)
+
+        if work_b > work_a:
+            # Validate chain_b fully
+            temp_utxo = UTXOSet()
+            for i, block in enumerate(chain_b):
+                expected_prev = "0" * 64 if i == 0 else chain_b[i - 1].block_hash
+                # Validate block structure
+                recomputed = BAB64BlockMiner.compute_block_hash(
+                    block.index, block.previous_hash, block.timestamp,
+                    block.merkle_root_hash, block.nonce, block.difficulty,
+                )
+                if recomputed != block.block_hash:
+                    return chain_a
+                if not BAB64BlockMiner.meets_difficulty(block.block_hash, block.difficulty):
+                    return chain_a
+                if block.previous_hash != expected_prev:
+                    return chain_a
+                if block.index != i:
+                    return chain_a
+                # Apply transactions
+                for tx in block.transactions:
+                    if tx.is_coinbase:
+                        temp_utxo.add_outputs(tx)
+                    else:
+                        valid, _ = temp_utxo.validate_transaction(tx)
+                        if not valid:
+                            return chain_a
+                        temp_utxo.apply_transaction(tx)
+            return chain_b
+        return chain_a
+
+
+# =============================================================================
+# COMPONENT 8 — BLOCKCHAIN
 # =============================================================================
 
 class BAB64Blockchain:
@@ -468,6 +552,53 @@ class BAB64Blockchain:
             return self.miner._image_bytes
         return None
 
+    @staticmethod
+    def create_genesis_block() -> BAB64Block:
+        """
+        Create the hardcoded genesis block.
+
+        Fixed timestamp, genesis address, embedded message.
+        """
+        # Coinbase with genesis message embedded in the hash
+        coinbase = BAB64CashTransaction(is_coinbase=True, coinbase_height=0)
+        coinbase.outputs.append(TxOutput(
+            recipient=GENESIS_ADDRESS,
+            amount=INITIAL_REWARD,
+            tx_hash="",
+            index=0,
+        ))
+        # Embed genesis message into the tx hash
+        h = hashlib.sha256()
+        h.update(GENESIS_MESSAGE.encode())
+        h.update(GENESIS_ADDRESS.encode())
+        h.update(b'coinbase')
+        h.update((0).to_bytes(4, 'big', signed=True))
+        coinbase.tx_hash = h.hexdigest()
+        for i, out in enumerate(coinbase.outputs):
+            out.tx_hash = coinbase.tx_hash
+            out.index = i
+
+        tx_hashes = [coinbase.tx_hash]
+        mr = merkle_root(tx_hashes)
+
+        # Mine with difficulty 1 and fixed timestamp
+        for nonce in range(10_000_000):
+            bh = BAB64BlockMiner.compute_block_hash(
+                0, "0" * 64, GENESIS_TIMESTAMP, mr, nonce, 1
+            )
+            if BAB64BlockMiner.meets_difficulty(bh, 1):
+                return BAB64Block(
+                    index=0,
+                    previous_hash="0" * 64,
+                    timestamp=GENESIS_TIMESTAMP,
+                    transactions=[coinbase],
+                    merkle_root_hash=mr,
+                    nonce=nonce,
+                    difficulty=1,
+                    block_hash=bh,
+                )
+        raise RuntimeError("Failed to mine genesis block")
+
     def genesis_block(self, miner: BAB64Identity = None) -> BAB64Block:
         """Create and add block 0 with initial coinbase."""
         m = miner or self.miner
@@ -491,6 +622,15 @@ class BAB64Blockchain:
         self.utxo_set.apply_transaction(coinbase)
         return block
 
+    def add_genesis(self) -> BAB64Block:
+        """Add the hardcoded genesis block and apply its coinbase."""
+        block = BAB64Blockchain.create_genesis_block()
+        self.chain.append(block)
+        self.difficulty = block.difficulty
+        for tx in block.transactions:
+            self.utxo_set.apply_transaction(tx)
+        return block
+
     def add_transaction_to_mempool(self, tx: BAB64CashTransaction) -> Tuple[bool, str]:
         """Validate and add a transaction to the mempool."""
         valid, err = self.utxo_set.validate_transaction(tx)
@@ -499,7 +639,8 @@ class BAB64Blockchain:
         self.mempool.append(tx)
         return True, ""
 
-    def mine_block(self, miner: BAB64Identity = None) -> Optional[BAB64Block]:
+    def mine_block(self, miner: BAB64Identity = None,
+                   timestamp: float = None) -> Optional[BAB64Block]:
         """Mine a new block with mempool transactions."""
         m = miner or self.miner
         addr = m.address_hex if m else self.miner_address
@@ -516,12 +657,29 @@ class BAB64Blockchain:
         )
         transactions = [coinbase] + list(self.mempool)
 
-        block = BAB64BlockMiner.mine_block(
-            index=height,
-            previous_hash=prev_hash,
-            transactions=transactions,
-            difficulty=self.difficulty,
-        )
+        # Use provided timestamp or current time
+        tx_hashes = [tx.tx_hash for tx in transactions]
+        mr = merkle_root(tx_hashes)
+        ts = timestamp if timestamp is not None else time.time()
+
+        block = None
+        for nonce in range(10_000_000):
+            bh = BAB64BlockMiner.compute_block_hash(
+                height, prev_hash, ts, mr, nonce, self.difficulty,
+            )
+            if BAB64BlockMiner.meets_difficulty(bh, self.difficulty):
+                block = BAB64Block(
+                    index=height,
+                    previous_hash=prev_hash,
+                    timestamp=ts,
+                    transactions=transactions,
+                    merkle_root_hash=mr,
+                    nonce=nonce,
+                    difficulty=self.difficulty,
+                    block_hash=bh,
+                )
+                break
+
         if block is None:
             return None
 
@@ -540,9 +698,18 @@ class BAB64Blockchain:
         """Query balance from the UTXO set."""
         return self.utxo_set.balance(address)
 
+    def median_time_past(self, chain: List[BAB64Block] = None) -> float:
+        """Median timestamp of the last 11 blocks (or fewer if chain is short)."""
+        c = chain if chain is not None else self.chain
+        if not c:
+            return 0.0
+        recent = c[-11:]
+        timestamps = sorted(b.timestamp for b in recent)
+        return statistics.median(timestamps)
+
     def validate_block(self, block: BAB64Block,
                        expected_prev_hash: str) -> Tuple[bool, str]:
-        """Validate a single block."""
+        """Validate a single block (basic structural checks)."""
         if block.previous_hash != expected_prev_hash:
             return False, "Previous hash mismatch"
 
@@ -573,6 +740,100 @@ class BAB64Blockchain:
 
         return True, ""
 
+    def validate_block_full(self, block: BAB64Block,
+                            expected_prev_hash: str,
+                            expected_height: int,
+                            preceding_chain: List[BAB64Block] = None,
+                            utxo_set: UTXOSet = None,
+                            current_time: float = None) -> Tuple[bool, str]:
+        """
+        Full block validation — all 10 consensus rules.
+
+        1. Block hash meets difficulty target
+        2. Previous hash matches chain tip
+        3. Timestamp > median of last 11 blocks
+        4. Timestamp < current time + 2 hours
+        5. First tx is coinbase with correct reward
+        6. Coinbase reward = block_reward(height) + sum(fees)
+        7. All non-coinbase transactions valid (UTXO rules)
+        8. Merkle root matches transaction hashes
+        9. No duplicate transactions within block
+        10. Block index matches expected height
+        """
+        now = current_time if current_time is not None else time.time()
+
+        # Rule 10: Block index matches expected height
+        if block.index != expected_height:
+            return False, f"Wrong block height: expected {expected_height}, got {block.index}"
+
+        # Rule 2: Previous hash matches
+        if block.previous_hash != expected_prev_hash:
+            return False, "Previous hash mismatch"
+
+        # Rule 1: Block hash meets difficulty
+        recomputed = BAB64BlockMiner.compute_block_hash(
+            block.index, block.previous_hash, block.timestamp,
+            block.merkle_root_hash, block.nonce, block.difficulty,
+        )
+        if recomputed != block.block_hash:
+            return False, "Block hash mismatch"
+        if not BAB64BlockMiner.meets_difficulty(block.block_hash, block.difficulty):
+            return False, "Block does not meet difficulty"
+
+        # Rule 3: Timestamp > median of last 11 blocks
+        if preceding_chain:
+            mtp = self.median_time_past(preceding_chain)
+            if block.timestamp <= mtp:
+                return False, "Timestamp not after median of last 11 blocks"
+
+        # Rule 4: Timestamp < current time + 2 hours
+        if block.timestamp > now + MAX_FUTURE_BLOCK_TIME:
+            return False, "Block timestamp too far in the future"
+
+        # Rule 8: Merkle root
+        tx_hashes = [tx.tx_hash for tx in block.transactions]
+        expected_mr = merkle_root(tx_hashes)
+        if expected_mr != block.merkle_root_hash:
+            return False, "Merkle root mismatch"
+
+        # Rule 9: No duplicate transactions
+        seen_tx = set()
+        for tx in block.transactions:
+            if tx.tx_hash in seen_tx:
+                return False, "Duplicate transaction in block"
+            seen_tx.add(tx.tx_hash)
+
+        # Rules 5, 6: Coinbase checks
+        if not block.transactions:
+            return False, "Block has no transactions"
+        if not block.transactions[0].is_coinbase:
+            return False, "First transaction must be coinbase"
+
+        # Calculate fees from non-coinbase txs
+        us = utxo_set or self.utxo_set
+        total_fees = 0
+        for tx in block.transactions[1:]:
+            if tx.is_coinbase:
+                return False, "Only first transaction can be coinbase"
+            total_fees += tx.fee(us)
+
+        expected_reward = block_reward(expected_height) + total_fees
+        coinbase = block.transactions[0]
+        actual_reward = sum(out.amount for out in coinbase.outputs)
+        if actual_reward != expected_reward:
+            return False, (
+                f"Coinbase reward mismatch: expected {expected_reward}, "
+                f"got {actual_reward}"
+            )
+
+        # Rule 7: Validate non-coinbase transactions
+        for tx in block.transactions[1:]:
+            valid, err = us.validate_transaction(tx)
+            if not valid:
+                return False, f"Invalid transaction: {err}"
+
+        return True, ""
+
     def validate_chain(self) -> Tuple[bool, str]:
         """Verify the entire chain."""
         for i, block in enumerate(self.chain):
@@ -582,31 +843,77 @@ class BAB64Blockchain:
                 return False, f"Block {i}: {err}"
         return True, ""
 
-    def difficulty_adjustment(self, target_block_time: float = 600.0,
-                              adjustment_interval: int = 2016) -> int:
+    def difficulty_adjustment(self) -> int:
         """
-        Adjust difficulty every `adjustment_interval` blocks.
-        Target: one block per `target_block_time` seconds.
+        Adjust difficulty every ADJUSTMENT_INTERVAL blocks.
+
+        new_diff = old_diff * (target_time / actual_time)
+        Clamped to [old/4, old*4]. Minimum difficulty: 1.
         """
-        if len(self.chain) < adjustment_interval:
+        if len(self.chain) < ADJUSTMENT_INTERVAL:
             return self.difficulty
 
-        recent = self.chain[-adjustment_interval:]
-        elapsed = recent[-1].timestamp - recent[0].timestamp
-        expected = target_block_time * (adjustment_interval - 1)
+        if len(self.chain) % ADJUSTMENT_INTERVAL != 0:
+            return self.difficulty
 
-        ratio = elapsed / expected if expected > 0 else 1.0
+        interval_blocks = self.chain[-ADJUSTMENT_INTERVAL:]
+        actual_time = interval_blocks[-1].timestamp - interval_blocks[0].timestamp
+
+        expected_time = TARGET_BLOCK_TIME * (ADJUSTMENT_INTERVAL - 1)
+
+        if actual_time <= 0:
+            actual_time = 1.0  # prevent division by zero
+
+        ratio = expected_time / actual_time
+        # Clamp ratio to [0.25, 4.0]
         ratio = max(0.25, min(4.0, ratio))
 
-        if ratio < 1.0:
-            new_diff = self.difficulty + 1
-        elif ratio > 1.0:
-            new_diff = max(1, self.difficulty - 1)
-        else:
-            new_diff = self.difficulty
+        new_diff = max(1, int(self.difficulty * ratio))
+        # Clamp to [old/4, old*4]
+        new_diff = max(max(1, self.difficulty // 4), min(self.difficulty * 4, new_diff))
+        # Ensure minimum of 1
+        new_diff = max(1, new_diff)
 
         self.difficulty = new_diff
         return new_diff
+
+    def handle_fork(self, competing_chain: List[BAB64Block]) -> bool:
+        """
+        If competing chain has more cumulative work and is valid,
+        switch to it. Revert UTXO set and reapply.
+
+        Returns True if we switched to the competing chain.
+        """
+        selected = ChainSelector.select_chain(
+            self.chain, competing_chain, self.utxo_set
+        )
+        if selected is competing_chain:
+            # Rebuild UTXO set from the new chain
+            self.utxo_set = UTXOSet()
+            for block in competing_chain:
+                for tx in block.transactions:
+                    if tx.is_coinbase:
+                        self.utxo_set.add_outputs(tx)
+                    else:
+                        self.utxo_set.apply_transaction(tx)
+            self.chain = list(competing_chain)
+            if competing_chain:
+                self.difficulty = competing_chain[-1].difficulty
+            return True
+        return False
+
+    @staticmethod
+    def verify_header(header: BlockHeader) -> Tuple[bool, str]:
+        """Verify a block header without the full block body."""
+        recomputed = BAB64BlockMiner.compute_block_hash(
+            header.index, header.previous_hash, header.timestamp,
+            header.merkle_root, header.nonce, header.difficulty,
+        )
+        if recomputed != header.block_hash:
+            return False, "Header hash mismatch"
+        if not BAB64BlockMiner.meets_difficulty(header.block_hash, header.difficulty):
+            return False, "Header does not meet difficulty"
+        return True, ""
 
 
 # =============================================================================
