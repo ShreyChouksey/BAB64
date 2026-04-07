@@ -209,6 +209,10 @@ def _serialize_block(block: BAB64Block) -> dict:
                 "signature": [b.hex() if isinstance(b, bytes) else b for b in inp.signature],
                 "verification_key": [b.hex() if isinstance(b, bytes) else b for b in inp.verification_key],
                 "owner_proof": inp.owner_proof.hex() if inp.owner_proof else "",
+                "ibst_leaf_index": inp.ibst_leaf_index,
+                "ibst_auth_path": [b.hex() if isinstance(b, bytes) else b for b in inp.ibst_auth_path],
+                "ibst_merkle_root": inp.ibst_merkle_root.hex() if inp.ibst_merkle_root else "",
+                "ibst_image_bytes": inp.ibst_image_bytes.hex() if inp.ibst_image_bytes else "",
             })
         for out in tx.outputs:
             tx_dict["outputs"].append({
@@ -593,6 +597,9 @@ class BAB64Node:
         if not peer.verack_received:
             await self._send_version(peer)
 
+        # Check if handshake is now complete
+        await self._maybe_start_sync(peer)
+
     async def _handle_verack(self, peer: Peer, payload: dict):
         """Handle VERACK: handshake complete."""
         peer.verack_received = True
@@ -603,7 +610,13 @@ class BAB64Node:
         if event:
             event.set()
 
-        # Trigger Initial Block Download if peer is ahead
+        # Check if handshake is now complete
+        await self._maybe_start_sync(peer)
+
+    async def _maybe_start_sync(self, peer: Peer):
+        """Trigger IBD once both VERSION and VERACK have been exchanged."""
+        if not peer.version_received or not peer.verack_received:
+            return
         my_height = len(self.blockchain.chain) - 1
         if peer.best_height > my_height:
             asyncio.create_task(self.sync_with_peer(peer))

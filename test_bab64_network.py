@@ -419,7 +419,7 @@ class TestTransactionRelay:
 @pytest.mark.timeout(10)
 class TestIBD:
     async def test_new_node_syncs_blocks(self, alice, bob):
-        """A new node downloads missing blocks from a peer."""
+        """A new node downloads missing blocks from a peer via manual sync."""
         node_a = await make_node(alice, n_blocks=3)  # genesis + 3
         node_b = await make_node(bob)                 # genesis only
         try:
@@ -429,14 +429,33 @@ class TestIBD:
                 await node_b.sync_with_peer(p)
             await asyncio.sleep(0.5)
 
-            # node_b should have received headers and requested blocks
-            assert len(node_b.blockchain.chain) >= 1
+            assert len(node_b.blockchain.chain) == 4  # genesis + 3
+            # All block hashes match
+            for i in range(4):
+                assert node_b.blockchain.chain[i].block_hash == \
+                    node_a.blockchain.chain[i].block_hash
+        finally:
+            await node_a.stop()
+            await node_b.stop()
+
+    async def test_auto_ibd_on_connect(self, alice, bob):
+        """IBD triggers automatically after handshake when peer is ahead."""
+        node_a = await make_node(alice, n_blocks=5)  # genesis + 5
+        node_b = await make_node(bob)                 # genesis only
+        try:
+            # B connects to A — auto-sync should trigger after handshake
+            await connect_nodes(node_b, node_a, settle_time=1.0)
+
+            assert len(node_b.blockchain.chain) == 6  # genesis + 5
+            for i in range(6):
+                assert node_b.blockchain.chain[i].block_hash == \
+                    node_a.blockchain.chain[i].block_hash
         finally:
             await node_a.stop()
             await node_b.stop()
 
     async def test_sync_with_peer_height(self, alice, bob):
-        """sync_with_peer sends GETBLOCKS when peer has higher chain."""
+        """sync_with_peer downloads all blocks when peer has higher chain."""
         node_a = await make_node(alice, n_blocks=5)
         node_b = await make_node(bob)
         try:
@@ -446,7 +465,8 @@ class TestIBD:
                 p.best_height = 5
                 await node_b.sync_with_peer(p)
 
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
+            assert len(node_b.blockchain.chain) == 6
         finally:
             await node_a.stop()
             await node_b.stop()
